@@ -46,6 +46,7 @@ exports.handler = async function (event, context) {
     const rawPath = event.path;
     const hostUrl = `https://${event.headers.host}`;
 
+    // 1. Resolve target asset URL execution routing
     if (rawPath.startsWith("/proxy/")) {
       const encoded = rawPath.slice("/proxy/".length);
       targetUrl = new URL(decodeURIComponent(encoded));
@@ -71,6 +72,7 @@ exports.handler = async function (event, context) {
       return { statusCode: 204, headers, body: "" };
     }
 
+    // 2. Map standard operational headers safely
     const outboundHeaders = {};
     const forwardableHeaders = [
       "accept", "accept-language", "cache-control", "content-type", 
@@ -110,64 +112,61 @@ exports.handler = async function (event, context) {
 
     const contentType = response.headers.get("content-type") || "";
     
-    if (contentType.includes("text/html")) {
+    // 3. Process Text, HTML and Asynchronous Webpack JavaScript Engine Chunks
+    if (contentType.includes("text/html") || contentType.includes("application/javascript") || contentType.includes("text/javascript")) {
       let text = await response.text();
       
-      const baseTagInject = `
-        <base href="${UPSTREAM}/">
-        <style type="text/css">
-          /* Structural override to guarantee layout visibility */
-          [class*="adblock"], [id*="adblock"], 
-          [class*="modal-root"], [class*="ModalContainer"],
-          div[style*="backdrop-filter"], div[style*="rgba(0, 0, 0"],
-          #interstitial-ad-container, .sc-unblock, div[class*="paywall"],
-          div[class*="AdBlockModal"], div[id*="ad-overlay"] {
-            display: none !important;
-            visibility: hidden !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
-          }
-          html, body {
-            overflow: auto !important;
-            position: static !important;
-          }
-        </style>
-        <script type="text/javascript">
-          (function() {
-            // Define robust, un-overrideable property definitions for ad spoofing
-            window.google_ad_client = "ca-pub-dummy";
-            window.adsbygoogle = { push: function() {}, loaded: true, cmd: [] };
-            
-            try {
-              Object.defineProperty(window, 'adBlockerDetected', { value: false, writable: false });
-              Object.defineProperty(window, 'google_ad_status', { value: 1, writable: false });
-            } catch(e) {}
+      // Server-side path rewriter: forces background script endpoints to map back to your proxy gateway domain
+      text = text.replace(/https:\/\/now\.gg/g, hostUrl);
+      text = text.replace(/https:\/\/([a-z0-9]+)\.now\.gg/g, (match, sub) => {
+        return `${hostUrl}/proxy/${encodeURIComponent(`https://\${sub}.now.gg`)}`;
+      });
 
-            // MutationObserver engine to destroy blocker boxes before they freeze the canvas
-            const observer = new MutationObserver((mutations) => {
-              for (const mutation of mutations) {
-                for (const node of mutation.addedNodes) {
-                  if (node.nodeType === 1) {
-                    const content = node.innerText || "";
-                    if (
-                      content.includes("allow ads") || 
-                      content.includes("ad blocker") || 
-                      content.includes("turn off your ad") ||
-                      node.className.includes("modal") ||
-                      node.id.includes("adblock")
-                    ) {
-                      node.remove();
+      // Handle raw root paths for background image elements
+      if (contentType.includes("text/html")) {
+        text = text.replace(/(src|href|action)="\/(?!\/)/g, `$1="${hostUrl}/`);
+        text = text.replace(/(src|href|action)='\/(?!\/)/g, `$1='${hostUrl}/`);
+
+        const antiBlockBypassScript = `
+          <style type="text/css">
+            [class*="adblock"], [id*="adblock"], 
+            [class*="modal-root"], [class*="ModalContainer"],
+            div[style*="backdrop-filter"], div[style*="rgba(0, 0, 0"],
+            #interstitial-ad-container, .sc-unblock, div[class*="paywall"],
+            div[class*="AdBlockModal"], div[id*="ad-overlay"] {
+              display: none !important;
+              visibility: hidden !important;
+              opacity: 0 !important;
+              pointer-events: none !important;
+            }
+          </style>
+          <script type="text/javascript">
+            (function() {
+              window.google_ad_client = "ca-pub-dummy";
+              window.adsbygoogle = { push: function() {}, loaded: true, cmd: [] };
+              try {
+                Object.defineProperty(window, 'adBlockerDetected', { value: false, writable: false });
+                Object.defineProperty(window, 'google_ad_status', { value: 1, writable: false });
+              } catch(e) {}
+
+              const observer = new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                  for (const node of mutation.addedNodes) {
+                    if (node.nodeType === 1) {
+                      const content = node.innerText || "";
+                      if (content.includes("allow ads") || content.includes("ad blocker") || node.className.includes("modal")) {
+                        node.remove();
+                      }
                     }
                   }
                 }
-              }
-            });
-            observer.observe(document.documentElement, { childList: true, subtree: true });
-          })();
-        </script>
-      `;
-      
-      text = text.replace("<head>", `<head>${baseTagInject}`);
+              });
+              observer.observe(document.documentElement, { childList: true, subtree: true });
+            })();
+          </script>
+        `;
+        text = text.replace("<head>", `<head>${antiBlockBypassScript}`);
+      }
       
       return {
         statusCode: response.status,
@@ -177,6 +176,7 @@ exports.handler = async function (event, context) {
       };
     }
 
+    // Binary Assets (Images, Audio assets, WebAssembly code blocks)
     const buffer = await response.arrayBuffer();
     return {
       statusCode: response.status,
