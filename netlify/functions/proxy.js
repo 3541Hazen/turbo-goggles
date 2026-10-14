@@ -46,7 +46,6 @@ exports.handler = async function (event, context) {
     const rawPath = event.path;
     const hostUrl = `https://${event.headers.host}`;
 
-    // 1. Resolve target asset URL execution routing
     if (rawPath.startsWith("/proxy/")) {
       const encoded = rawPath.slice("/proxy/".length);
       targetUrl = new URL(decodeURIComponent(encoded));
@@ -72,7 +71,6 @@ exports.handler = async function (event, context) {
       return { statusCode: 204, headers, body: "" };
     }
 
-    // 2. Map standard operational headers safely
     const outboundHeaders = {};
     const forwardableHeaders = [
       "accept", "accept-language", "cache-control", "content-type", 
@@ -112,32 +110,70 @@ exports.handler = async function (event, context) {
 
     const contentType = response.headers.get("content-type") || "";
     
-    // 3. Process Text, HTML and Asynchronous Webpack JavaScript Engine Chunks
     if (contentType.includes("text/html") || contentType.includes("application/javascript") || contentType.includes("text/javascript")) {
       let text = await response.text();
       
-      // Server-side path rewriter: forces background script endpoints to map back to your proxy gateway domain
-      text = text.replace(/https:\/\/now\.gg/g, hostUrl);
-      text = text.replace(/https:\/\/([a-z0-9]+)\.now\.gg/g, (match, sub) => {
-        return `${hostUrl}/proxy/${encodeURIComponent(`https://\${sub}.now.gg`)}`;
+      text = text.replace(/https:\/\/([a-zA-Z0-9_\-\.]+)\.now\.gg/g, (match, subdomains) => {
+        if (subdomains.includes("proxy")) return match;
+        return `${hostUrl}/proxy/${encodeURIComponent(`https://\${subdomains}.now.gg`)}`;
       });
+      text = text.replace(/https:\/\/now\.gg/g, hostUrl);
 
-      // Handle raw root paths for background image elements
       if (contentType.includes("text/html")) {
         text = text.replace(/(src|href|action)="\/(?!\/)/g, `$1="${hostUrl}/`);
         text = text.replace(/(src|href|action)='\/(?!\/)/g, `$1='${hostUrl}/`);
 
-        const antiBlockBypassScript = `
+        const gameOnlyLayoutAndBypass = `
           <style type="text/css">
-            [class*="adblock"], [id*="adblock"], 
-            [class*="modal-root"], [class*="ModalContainer"],
-            div[style*="backdrop-filter"], div[style*="rgba(0, 0, 0"],
-            #interstitial-ad-container, .sc-unblock, div[class*="paywall"],
+            /* FORCE FULL-WINDOW GAME CANVAS ONLY */
+            
+            /* Hide the main header navigation, search bars, and profile buttons */
+            header, nav, [class*="header"], [id*="header"], [class*="navbar"], 
+            .header-container, #top-bar-contain, [class*="searchContainer"] {
+              display: none !important;
+              height: 0 !important;
+            }
+
+            /* Hide list sidebars, game title blocks, recommended lists, and ad blocks */
+            aside, [class*="sidebar"], [id*="sidebar"], [class*="left-nav"],
+            [class*="right-column"], [class*="recommendation"], [class*="game-list"],
+            [class*="ad-container"], div[id*="ad-container"], #interstitial-ad-container {
+              display: none !important;
+              width: 0 !important;
+            }
+
+            /* Force the structural container wrapping the game viewport to expand completely */
+            html, body, #root, [id*="app"], [class*="app-container"], [class*="main-layout"] {
+              margin: 0 !important;
+              padding: 0 !important;
+              width: 100vw !important;
+              height: 100vh !important;
+              overflow: hidden !important;
+              position: fixed !important;
+              top: 0 !important;
+              left: 0 !important;
+              background: #000 !important;
+            }
+
+            /* Target the absolute innermost video streaming frame / canvas player element */
+            iframe, canvas, #game-element, [class*="game-player"], [class*="video-stream"], 
+            [id*="player-container"], div[class*="canvas-wrapper"] {
+              position: fixed !important;
+              top: 0 !important;
+              left: 0 !important;
+              width: 100vw !important;
+              height: 100vh !important;
+              z-index: 999999 !important;
+              margin: 0 !important;
+              padding: 0 !important;
+              display: block !important;
+            }
+
+            /* Clear out ad block text covers and popup window blockers smoothly */
+            [class*="ModalContainer"], [class*="paywall"], .sc-unblock, 
             div[class*="AdBlockModal"], div[id*="ad-overlay"] {
               display: none !important;
-              visibility: hidden !important;
               opacity: 0 !important;
-              pointer-events: none !important;
             }
           </style>
           <script type="text/javascript">
@@ -154,7 +190,7 @@ exports.handler = async function (event, context) {
                   for (const node of mutation.addedNodes) {
                     if (node.nodeType === 1) {
                       const content = node.innerText || "";
-                      if (content.includes("allow ads") || content.includes("ad blocker") || node.className.includes("modal")) {
+                      if (content.includes("allow ads") || content.includes("ad blocker")) {
                         node.remove();
                       }
                     }
@@ -165,7 +201,7 @@ exports.handler = async function (event, context) {
             })();
           </script>
         `;
-        text = text.replace("<head>", `<head>${antiBlockBypassScript}`);
+        text = text.replace("<head>", `<head>${gameOnlyLayoutAndBypass}`);
       }
       
       return {
@@ -176,7 +212,6 @@ exports.handler = async function (event, context) {
       };
     }
 
-    // Binary Assets (Images, Audio assets, WebAssembly code blocks)
     const buffer = await response.arrayBuffer();
     return {
       statusCode: response.status,
