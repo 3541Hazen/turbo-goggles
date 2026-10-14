@@ -95,7 +95,6 @@ exports.handler = async function (event, context) {
 
     const responseHeaders = { ...getCorsHeaders() };
     response.headers.forEach((value, key) => {
-      // Don't forward restrictive security policies that freeze iframe assets
       if (!["content-security-policy", "x-frame-options", "content-encoding"].includes(key.toLowerCase())) {
         responseHeaders[key] = value;
       }
@@ -111,14 +110,61 @@ exports.handler = async function (event, context) {
 
     const contentType = response.headers.get("content-type") || "";
     
-    // Core HTML / JS Modification Layer to stop the blank page loop
     if (contentType.includes("text/html") || contentType.includes("application/javascript") || contentType.includes("text/javascript")) {
       let text = await response.text();
       
       if (contentType.includes("text/html")) {
-        // Force relative elements, assets, and source sets to pass through your Netlify mirror gateway
         text = text.replace(/(src|href|action)="\/(?!\/)/g, `$1="${hostUrl}/`);
         text = text.replace(/(src|href|action)='\/(?!\/)/g, `$1='${hostUrl}/`);
+
+        // INJECT THE ABSOLUTE BYPASS LAYER
+        const absoluteBypass = `
+          <style type="text/css">
+            /* Nuclear option: hide any blocking modals, banners, wraps, and unlock scrolling */
+            [class*="adblock"], [id*="adblock"], 
+            [class*="modal-root"], [class*="ModalContainer"],
+            div[style*="backdrop-filter"], div[style*="rgba(0, 0, 0"],
+            #interstitial-ad-container, .sc-unblock,
+            iframe[src*="google"], div[class*="paywall"] {
+              display: none !important;
+              visibility: hidden !important;
+              opacity: 0 !important;
+              pointer-events: none !important;
+              left: -9999px !important;
+            }
+            html, body {
+              overflow: auto !important;
+              position: static !important;
+            }
+          </style>
+          <script type="text/javascript">
+            (function() {
+              // Stub all global metrics and ad modules to prevent crash-loops
+              window.google_ad_client = "ca-pub-dummy";
+              window.adsbygoogle = { push: function() {}, loaded: true };
+              window.adBlockerDetected = false;
+              
+              // Force local runtime functions to always assume ads loaded cleanly
+              Object.defineProperty(window, 'google_ad_status', { value: 1, writable: false });
+              
+              // Permanently scrub popup nodes if they attempt to inject dynamically into the DOM
+              const observer = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                  mutation.addedNodes.forEach((node) => {
+                    if (node.nodeType === 1) {
+                      const textMatch = node.innerText || "";
+                      if (textMatch.includes("allow ads") || textMatch.includes("ad blocker") || node.className.includes("modal")) {
+                        node.remove();
+                      }
+                    }
+                  });
+                });
+              });
+              observer.observe(document.documentElement, { childList: true, subtree: true });
+            })();
+          </script>
+        `;
+        text = text.replace("<head>", `<head>${absoluteBypass}`);
       }
       
       return {
@@ -129,7 +175,6 @@ exports.handler = async function (event, context) {
       };
     }
 
-    // Binary Assets (WASM, Images, Audio streams)
     const buffer = await response.arrayBuffer();
     return {
       statusCode: response.status,
