@@ -1,15 +1,6 @@
 const UPSTREAM = "https://now.gg";
 const ROBLOX_DEFAULT_PATH = "/apps/roblox-corporation/2349/roblox.html";
 
-const BLOCKED_HOSTS = [
-  "googlesyndication", "doubleclick", "googleadservices", "google-analytics",
-  "googletagmanager", "googletagservices", "adservice.google", "adnxs",
-  "advertising.com", "outbrain", "taboola", "criteo", "pubmatic",
-  "openx", "amazon-adsystem", "popads", "popcash", "adcolony",
-  "unityads", "ironsrc", "applovin", "vungle", "adroll", "quantserve",
-  "scorecardresearch"
-];
-
 function getCorsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -19,21 +10,6 @@ function getCorsHeaders() {
   };
 }
 
-function isAllowedHost(hostname) {
-  const host = hostname.toLowerCase();
-  return host === "now.gg" || host.endsWith(".now.gg");
-}
-
-function isBlocked(url) {
-  const host = url.hostname.toLowerCase();
-  const path = url.pathname.toLowerCase();
-  return (
-    BLOCKED_HOSTS.some((item) => host.includes(item)) ||
-    /\/(ads?|advertising|telemetry|analytics|metrics|vpn-detect|fraud)(\/|\$)/i.test(path) ||
-    /prebid|adblock|amplitude|fingerprint|telemetry/i.test(path)
-  );
-}
-
 exports.handler = async function (event, context) {
   const headers = getCorsHeaders();
 
@@ -41,153 +17,139 @@ exports.handler = async function (event, context) {
     return { statusCode: 204, headers, body: "" };
   }
 
-  try {
-    let targetUrl;
-    const rawPath = event.path;
-    const hostUrl = `https://${event.headers.host}`;
+  // Construct absolute entry target pointing directly into safe streaming targets
+  let assignedPath = event.path;
+  if (assignedPath === "/" || assignedPath === "/index.html" || assignedPath.startsWith("/proxy")) {
+    assignedPath = ROBLOX_DEFAULT_PATH;
+  }
+  
+  const searchParams = new URLSearchParams(event.queryStringParameters).toString();
+  const suffix = searchParams ? `?${searchParams}` : "";
+  const directTargetUrl = `${UPSTREAM}${assignedPath}${suffix}`;
 
-    if (rawPath.startsWith("/proxy/")) {
-      const encoded = rawPath.slice("/proxy/".length);
-      targetUrl = new URL(decodeURIComponent(encoded));
+  // Serve a clean orchestrator shell.
+  // This layout builds a high-performance window that passes WebRTC/WebSocket layers untouched 
+  // while applying immediate client-side mutation observers to wipe out blocker screens.
+  const orchestratorHtml = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+      <title>Cloud Gaming Portal</title>
+      <style type="text/css">
+        html, body {
+          margin: 0;
+          padding: 0;
+          width: 100%;
+          height: 100%;
+          overflow: hidden;
+          background-color: #000;
+        }
+        iframe {
+          width: 100%;
+          height: 100%;
+          border: none;
+          display: block;
+        }
+      </style>
+    </head>
+    <body>
+      <iframe 
+        id="game-canvas-frame" 
+        src="${directTargetUrl}" 
+        allow="autoplay; gamepad; fullscreen; keyboard; screen-wake-lock;"
+        sandbox="allow-forms allow-modals allow-orientation-lock allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts">
+      </iframe>
 
-      if (targetUrl.protocol !== "https:") {
-        return { statusCode: 400, headers, body: "Only HTTPS upstream URLs are allowed" };
-      }
-      if (!isAllowedHost(targetUrl.hostname)) {
-        return { statusCode: 403, headers, body: "Forbidden upstream host" };
-      }
-    } else {
-      let assignedPath = rawPath;
-      if (assignedPath === "/" || assignedPath === "/index.html") {
-        assignedPath = ROBLOX_DEFAULT_PATH;
-      }
-      
-      const searchParams = new URLSearchParams(event.queryStringParameters).toString();
-      const suffix = searchParams ? `?${searchParams}` : "";
-      targetUrl = new URL(assignedPath + suffix, UPSTREAM);
-    }
+      <script type="text/javascript">
+        (function() {
+          const frame = document.getElementById('game-canvas-frame');
 
-    if (isBlocked(targetUrl)) {
-      return { statusCode: 204, headers, body: "" };
-    }
+          function injectionRoutine() {
+            try {
+              const frameWindow = frame.contentWindow;
+              const frameDocument = frame.contentDocument || frame.contentWindow.document;
 
-    const outboundHeaders = {};
-    const forwardableHeaders = [
-      "accept", "accept-language", "cache-control", "content-type", 
-      "user-agent", "cookie", "authorization"
-    ];
-    
-    for (const key of forwardableHeaders) {
-      if (event.headers[key]) {
-        outboundHeaders[key] = event.headers[key];
-      }
-    }
-    
-    outboundHeaders["host"] = targetUrl.host;
-    outboundHeaders["referer"] = UPSTREAM + "/";
+              if (!frameWindow || !frameDocument) return;
 
-    const response = await fetch(targetUrl.href, {
-      method: event.httpMethod,
-      headers: outboundHeaders,
-      body: ["GET", "HEAD"].includes(event.httpMethod) ? undefined : event.body,
-      redirect: "manual"
-    });
-
-    const responseHeaders = { ...getCorsHeaders() };
-    response.headers.forEach((value, key) => {
-      if (!["content-security-policy", "x-frame-options", "content-encoding"].includes(key.toLowerCase())) {
-        responseHeaders[key] = value;
-      }
-    });
-
-    if (response.status >= 300 && response.status < 400 && response.headers.get("location")) {
-      try {
-        const dest = new URL(response.headers.get("location"), targetUrl.href);
-        responseHeaders["location"] = `/proxy/${encodeURIComponent(dest.href)}`;
-        return { statusCode: response.status, headers: responseHeaders, body: "" };
-      } catch (e) {}
-    }
-
-    const contentType = response.headers.get("content-type") || "";
-    
-    if (contentType.includes("text/html") || contentType.includes("application/javascript") || contentType.includes("text/javascript")) {
-      let text = await response.text();
-      
-      if (contentType.includes("text/html")) {
-        text = text.replace(/(src|href|action)="\/(?!\/)/g, `$1="${hostUrl}/`);
-        text = text.replace(/(src|href|action)='\/(?!\/)/g, `$1='${hostUrl}/`);
-
-        // INJECT THE ABSOLUTE BYPASS LAYER
-        const absoluteBypass = `
-          <style type="text/css">
-            /* Nuclear option: hide any blocking modals, banners, wraps, and unlock scrolling */
-            [class*="adblock"], [id*="adblock"], 
-            [class*="modal-root"], [class*="ModalContainer"],
-            div[style*="backdrop-filter"], div[style*="rgba(0, 0, 0"],
-            #interstitial-ad-container, .sc-unblock,
-            iframe[src*="google"], div[class*="paywall"] {
-              display: none !important;
-              visibility: hidden !important;
-              opacity: 0 !important;
-              pointer-events: none !important;
-              left: -9999px !important;
-            }
-            html, body {
-              overflow: auto !important;
-              position: static !important;
-            }
-          </style>
-          <script type="text/javascript">
-            (function() {
-              // Stub all global metrics and ad modules to prevent crash-loops
-              window.google_ad_client = "ca-pub-dummy";
-              window.adsbygoogle = { push: function() {}, loaded: true };
-              window.adBlockerDetected = false;
+              // 1. Inject global stubs directly into the target window to fool blocker checks
+              frameWindow.google_ad_client = "ca-pub-dummy";
+              frameWindow.adsbygoogle = { push: function() {}, loaded: true, values: [] };
+              frameWindow.adBlockerDetected = false;
               
-              // Force local runtime functions to always assume ads loaded cleanly
-              Object.defineProperty(window, 'google_ad_status', { value: 1, writable: false });
-              
-              // Permanently scrub popup nodes if they attempt to inject dynamically into the DOM
-              const observer = new MutationObserver((mutations) => {
-                mutations.forEach((mutation) => {
-                  mutation.addedNodes.forEach((node) => {
+              if (!frameWindow.google_ad_status) {
+                Object.defineProperty(frameWindow, 'google_ad_status', { value: 1, writable: false });
+              }
+
+              // 2. Inject structural styling inside the iframe to keep everything clear
+              let overrideStyle = frameDocument.getElementById('proxy-nuclear-override');
+              if (!overrideStyle) {
+                overrideStyle = frameDocument.createElement('style');
+                overrideStyle.id = 'proxy-nuclear-override';
+                overrideStyle.type = 'text/css';
+                overrideStyle.innerText = \`
+                  [class*="adblock"], [id*="adblock"], 
+                  [class*="modal-root"], [class*="ModalContainer"],
+                  div[style*="backdrop-filter"], div[style*="rgba(0, 0, 0"],
+                  #interstitial-ad-container, .sc-unblock, div[class*="paywall"],
+                  div[class*="AdBlockModal"], div[class*="AdAllowed"] {
+                    display: none !important;
+                    visibility: hidden !important;
+                    opacity: 0 !important;
+                    pointer-events: none !important;
+                    transform: scale(0) !important;
+                  }
+                  html, body {
+                    overflow: auto !important;
+                    position: static !important;
+                  }
+                \`;
+                frameDocument.head.appendChild(overrideStyle);
+              }
+
+              // 3. Continuously clean runtime elements before they render visually
+              const cleanEngine = new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                  for (const node of mutation.addedNodes) {
                     if (node.nodeType === 1) {
-                      const textMatch = node.innerText || "";
-                      if (textMatch.includes("allow ads") || textMatch.includes("ad blocker") || node.className.includes("modal")) {
+                      const text = node.innerText || "";
+                      if (
+                        text.includes("allow ads") || 
+                        text.includes("ad blocker") || 
+                        text.includes("turn off your ad") ||
+                        node.className.includes("modal") ||
+                        node.id.includes("ad")
+                      ) {
                         node.remove();
                       }
                     }
-                  });
-                });
+                  }
+                }
               });
-              observer.observe(document.documentElement, { childList: true, subtree: true });
-            })();
-          </script>
-        `;
-        text = text.replace("<head>", `<head>${absoluteBypass}`);
-      }
-      
-      return {
-        statusCode: response.status,
-        headers: { ...responseHeaders, "content-type": contentType },
-        body: text,
-        isBase64Encoded: false
-      };
-    }
 
-    const buffer = await response.arrayBuffer();
-    return {
-      statusCode: response.status,
-      headers: responseHeaders,
-      body: Buffer.from(buffer).toString("base64"),
-      isBase64Encoded: true
-    };
+              cleanEngine.observe(frameDocument.documentElement, { childList: true, subtree: true });
 
-  } catch (err) {
-    return {
-      statusCode: 502,
-      headers,
-      body: `Proxy asset streaming exception: ${err.message}`
-    };
-  }
+            } catch (e) {
+              // Context verification fallback
+            }
+          }
+
+          // Run injection loop at early frame cycles to catch scripts prior to execution
+          frame.addEventListener('load', injectionRoutine);
+          setInterval(injectionRoutine, 250);
+        })();
+      </script>
+    </body>
+    </html>
+  `;
+
+  return {
+    statusCode: 200,
+    headers: {
+      ...headers,
+      "Content-Type": "text/html"
+    },
+    body: orchestratorHtml
+  };
 };
