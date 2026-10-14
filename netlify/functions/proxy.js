@@ -1,190 +1,218 @@
+// netlify/functions/proxy.js
+
 const UPSTREAM = "https://now.gg";
-const ROBLOX_DEFAULT_PATH = "/apps/roblox-corporation/2349/roblox.html";
+const ROBLOX_DEFAULT_PATH =
+  "/apps/roblox-corporation/2349/roblox.html";
 
-const BLOCKED_HOSTS = [
-  "googlesyndication", "doubleclick", "googleadservices", "google-analytics",
-  "googletagmanager", "googletagservices", "adservice.google", "adnxs",
-  "advertising.com", "outbrain", "taboola", "criteo", "pubmatic",
-  "openx", "amazon-adsystem", "popads", "popcash", "adcolony",
-  "unityads", "ironsrc", "applovin", "vungle", "adroll", "quantserve",
-  "scorecardresearch"
-];
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods":
+    "GET, HEAD, OPTIONS",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization",
+  "Cache-Control": "no-store",
+};
 
-function getCorsHeaders() {
+function jsonResponse(statusCode, data) {
   return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "*",
-    "Access-Control-Expose-Headers": "*"
+    statusCode,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify(data, null, 2),
   };
 }
 
-function isAllowedHost(hostname) {
-  const host = hostname.toLowerCase();
-  return host === "now.gg" || host.endsWith(".now.gg");
+function getRequestPath(event) {
+  // Netlify may expose the original path in rawUrl,
+  // path, or requestContext depending on the runtime.
+  const rawUrl = event.rawUrl;
+
+  if (rawUrl) {
+    try {
+      return new URL(rawUrl).pathname;
+    } catch {
+      // Fall through to the event path.
+    }
+  }
+
+  return event.path || "/";
 }
 
-function isBlocked(url) {
-  const host = url.hostname.toLowerCase();
-  const path = url.pathname.toLowerCase();
-  return (
-    BLOCKED_HOSTS.some((item) => host.includes(item)) ||
-    /\/(ads?|advertising|telemetry|analytics|metrics|vpn-detect|fraud)(\/|\$)/i.test(path) ||
-    /prebid|adblock|amplitude|fingerprint|telemetry/i.test(path)
-  );
+function getTargetUrl(event) {
+  const path = getRequestPath(event);
+
+  if (path === "/" || path === "/index.html") {
+    return new URL(ROBLOX_DEFAULT_PATH, UPSTREAM);
+  }
+
+  // Do not accept arbitrary upstream URLs from the caller.
+  // Only relative paths on the configured upstream are allowed.
+  if (!path.startsWith("/") || path.startsWith("//")) {
+    throw new Error("Invalid request path");
+  }
+
+  const target = new URL(path, UPSTREAM);
+
+  if (
+    target.protocol !== "https:" ||
+    (target.hostname !== "now.gg" &&
+      !target.hostname.endsWith(".now.gg"))
+  ) {
+    throw new Error("Invalid upstream host");
+  }
+
+  const query = event.queryStringParameters || {};
+
+  for (const [key, value] of Object.entries(query)) {
+    if (key !== "debug" && value != null) {
+      target.searchParams.set(key, value);
+    }
+  }
+
+  return target;
 }
 
-exports.handler = async function (event, context) {
-  const headers = getCorsHeaders();
+exports.handler = async function (event) {
+  const method = (event.httpMethod || "GET").toUpperCase();
 
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers, body: "" };
+  if (method === "OPTIONS") {
+    return {
+      statusCode: 204,
+      headers: CORS_HEADERS,
+      body: "",
+    };
+  }
+
+  if (!["GET", "HEAD"].includes(method)) {
+    return jsonResponse(405, {
+      error: "Method not allowed",
+      allowedMethods: ["GET", "HEAD", "OPTIONS"],
+    });
+  }
+
+  // Diagnostic endpoint:
+  // /.netlify/functions/proxy?debug=1
+  if (event.queryStringParameters?.debug === "1") {
+    try {
+      const response = await fetch(UPSTREAM, {
+        method: "GET",
+        redirect: "manual",
+        signal: AbortSignal.timeout(15000),
+      });
+
+      return jsonResponse(200, {
+        functionRunning: true,
+        upstreamStatus: response.status,
+        upstreamContentType:
+          response.headers.get("content-type"),
+        upstreamRedirect:
+          response.headers.get("location"),
+        note:
+          "This checks basic connectivity only, not game compatibility.",
+      });
+    } catch (error) {
+      return jsonResponse(502, {
+        functionRunning: true,
+        upstreamError: error.message,
+      });
+    }
+  }
+
+  let target;
+
+  try {
+    target = getTargetUrl(event);
+  } catch (error) {
+    return jsonResponse(400, {
+      error: error.message,
+    });
   }
 
   try {
-    let targetUrl;
-    const rawPath = event.path;
-    const hostUrl = `https://${event.headers.host}`;
-
-    if (rawPath.startsWith("/proxy/")) {
-      const encoded = rawPath.slice("/proxy/".length);
-      targetUrl = new URL(decodeURIComponent(encoded));
-
-      if (targetUrl.protocol !== "https:") {
-        return { statusCode: 400, headers, body: "Only HTTPS upstream URLs are allowed" };
-      }
-      if (!isAllowedHost(targetUrl.hostname)) {
-        return { statusCode: 403, headers, body: "Forbidden upstream host" };
-      }
-    } else {
-      let assignedPath = rawPath;
-      if (assignedPath === "/" || assignedPath === "/index.html") {
-        assignedPath = ROBLOX_DEFAULT_PATH;
-      }
-      
-      const searchParams = new URLSearchParams(event.queryStringParameters).toString();
-      const suffix = searchParams ? `?${searchParams}` : "";
-      targetUrl = new URL(assignedPath + suffix, UPSTREAM);
-    }
-
-    if (isBlocked(targetUrl)) {
-      return { statusCode: 204, headers, body: "" };
-    }
-
-    const outboundHeaders = {};
-    const forwardableHeaders = [
-      "accept", "accept-language", "cache-control", "content-type", 
-      "user-agent", "cookie", "authorization"
-    ];
-    
-    for (const key of forwardableHeaders) {
-      if (event.headers[key]) {
-        outboundHeaders[key] = event.headers[key];
-      }
-    }
-    
-    outboundHeaders["host"] = targetUrl.host;
-    outboundHeaders["referer"] = UPSTREAM + "/";
-
-    const response = await fetch(targetUrl.href, {
-      method: event.httpMethod,
-      headers: outboundHeaders,
-      body: ["GET", "HEAD"].includes(event.httpMethod) ? undefined : event.body,
-      redirect: "manual"
+    const upstreamResponse = await fetch(target.href, {
+      method,
+      redirect: "manual",
+      signal: AbortSignal.timeout(20000),
+      headers: {
+        Accept:
+          event.headers?.accept || "*/*",
+        "Accept-Language":
+          event.headers?.["accept-language"] || "en-US,en;q=0.9",
+        "User-Agent":
+          event.headers?.["user-agent"] || "Mozilla/5.0",
+      },
     });
 
-    const responseHeaders = { ...getCorsHeaders() };
-    response.headers.forEach((value, key) => {
-      if (!["content-security-policy", "x-frame-options", "content-encoding"].includes(key.toLowerCase())) {
-        responseHeaders[key] = value;
-      }
-    });
+    // Do not silently follow redirects to another host.
+    // Report them so the actual redirect can be diagnosed.
+    const location =
+      upstreamResponse.headers.get("location");
 
-    if (response.status >= 300 && response.status < 400 && response.headers.get("location")) {
-      try {
-        const dest = new URL(response.headers.get("location"), targetUrl.href);
-        responseHeaders["location"] = `/proxy/${encodeURIComponent(dest.href)}`;
-        return { statusCode: response.status, headers: responseHeaders, body: "" };
-      } catch (e) {}
-    }
-
-    const contentType = response.headers.get("content-type") || "";
-    
-    if (contentType.includes("text/html") || contentType.includes("application/javascript") || contentType.includes("text/javascript")) {
-      let text = await response.text();
-      
-      // Fixed Server Rewrite Layer: Now matches underscores, hyphens, and nested subdomains cleanly
-      text = text.replace(/https:\/\/([a-zA-Z0-9_\-\.]+)\.now\.gg/g, (match, subdomains) => {
-        // Prevent infinite nested loops if the path was already processed
-        if (subdomains.includes("proxy")) return match;
-        return `${hostUrl}/proxy/${encodeURIComponent(`https://\${subdomains}.now.gg`)}`;
-      });
-      text = text.replace(/https:\/\/now\.gg/g, hostUrl);
-
-      if (contentType.includes("text/html")) {
-        text = text.replace(/(src|href|action)="\/(?!\/)/g, `$1="${hostUrl}/`);
-        text = text.replace(/(src|href|action)='\/(?!\/)/g, `$1='${hostUrl}/`);
-
-        const antiBlockBypassScript = `
-          <style type="text/css">
-            /* Clean ad banner frame backgrounds without breaking game engine nodes */
-            div[class*="ad-container"], div[id*="ad-container"],
-            div[class*="ModalContainer"], div[class*="paywall"],
-            #interstitial-ad-container, .sc-unblock {
-              opacity: 0 !important;
-              pointer-events: none !important;
-            }
-          </style>
-          <script type="text/javascript">
-            (function() {
-              window.google_ad_client = "ca-pub-dummy";
-              window.adsbygoogle = { push: function() {}, loaded: true, cmd: [] };
-              try {
-                Object.defineProperty(window, 'adBlockerDetected', { value: false, writable: false });
-                Object.defineProperty(window, 'google_ad_status', { value: 1, writable: false });
-              } catch(e) {}
-
-              // Keep DOM verification functions moving forward smoothly
-              const observer = new MutationObserver((mutations) => {
-                for (const mutation of mutations) {
-                  for (const node of mutation.addedNodes) {
-                    if (node.nodeType === 1) {
-                      const content = node.innerText || "";
-                      if (content.includes("allow ads") || content.includes("ad blocker")) {
-                        node.remove();
-                      }
-                    }
-                  }
-                }
-              });
-              observer.observe(document.documentElement, { childList: true, subtree: true });
-            })();
-          </script>
-        `;
-        text = text.replace("<head>", `<head>${antiBlockBypassScript}`);
-      }
-      
+    if (
+      upstreamResponse.status >= 300 &&
+      upstreamResponse.status < 400 &&
+      location
+    ) {
       return {
-        statusCode: response.status,
-        headers: { ...responseHeaders, "content-type": contentType },
-        body: text,
-        isBase64Encoded: false
+        statusCode: upstreamResponse.status,
+        headers: {
+          ...CORS_HEADERS,
+          Location: location,
+        },
+        body: "",
       };
     }
 
-    const buffer = await response.arrayBuffer();
-    return {
-      statusCode: response.status,
-      headers: responseHeaders,
-      body: Buffer.from(buffer).toString("base64"),
-      isBase64Encoded: true
+    const contentType =
+      upstreamResponse.headers.get("content-type") ||
+      "application/octet-stream";
+
+    const responseHeaders = {
+      ...CORS_HEADERS,
+      "Content-Type": contentType,
     };
 
-  } catch (err) {
+    // Preserve useful diagnostic information.
+    if (upstreamResponse.status >= 400) {
+      return jsonResponse(
+        upstreamResponse.status,
+        {
+          error: "Upstream request failed",
+          upstreamStatus: upstreamResponse.status,
+          upstreamUrl: target.href,
+          contentType,
+        }
+      );
+    }
+
+    if (method === "HEAD") {
+      return {
+        statusCode: upstreamResponse.status,
+        headers: responseHeaders,
+        body: "",
+      };
+    }
+
+    const bytes = Buffer.from(
+      await upstreamResponse.arrayBuffer()
+    );
+
     return {
-      statusCode: 502,
-      headers,
-      body: `Proxy asset streaming exception: ${err.message}`
+      statusCode: upstreamResponse.status,
+      headers: responseHeaders,
+      body: bytes.toString("base64"),
+      isBase64Encoded: true,
     };
+  } catch (error) {
+    return jsonResponse(502, {
+      error: "Upstream request failed",
+      message: error.message,
+      target: target.href,
+    });
   }
 };
+
+
+Note: This diagnostic version deliberately does not rewrite upstream HTML or assets. It helps isolate whether the upstream is reachable, but it is not a complete reverse proxy for a cloud gaming session. For actual gameplay, use the provider-supported embedding method and authorization.
