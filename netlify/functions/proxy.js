@@ -37,7 +37,6 @@ function isBlocked(url) {
 exports.handler = async function (event, context) {
   const headers = getCorsHeaders();
 
-  // Handle CORS preflight options request
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers, body: "" };
   }
@@ -45,8 +44,8 @@ exports.handler = async function (event, context) {
   try {
     let targetUrl;
     const rawPath = event.path;
+    const hostUrl = `https://${event.headers.host}`;
 
-    // Check if handling an explicit deeply nested proxy route
     if (rawPath.startsWith("/proxy/")) {
       const encoded = rawPath.slice("/proxy/".length);
       targetUrl = new URL(decodeURIComponent(encoded));
@@ -58,31 +57,34 @@ exports.handler = async function (event, context) {
         return { statusCode: 403, headers, body: "Forbidden upstream host" };
       }
     } else {
-      // Default entry point mapping
       let assignedPath = rawPath;
       if (assignedPath === "/" || assignedPath === "/index.html") {
         assignedPath = ROBLOX_DEFAULT_PATH;
       }
       
-      // Append original query string parameters
       const searchParams = new URLSearchParams(event.queryStringParameters).toString();
       const suffix = searchParams ? `?${searchParams}` : "";
       targetUrl = new URL(assignedPath + suffix, UPSTREAM);
     }
 
-    // Silent drops for trackers and ad scripts
     if (isBlocked(targetUrl)) {
       return { statusCode: 204, headers, body: "" };
     }
 
-    // Clone headers safely for downstream requests
-    const outboundHeaders = { ...event.headers };
+    const outboundHeaders = {};
+    const forwardableHeaders = [
+      "accept", "accept-language", "cache-control", "content-type", 
+      "user-agent", "cookie", "authorization"
+    ];
+    
+    for (const key of forwardableHeaders) {
+      if (event.headers[key]) {
+        outboundHeaders[key] = event.headers[key];
+      }
+    }
+    
     outboundHeaders["host"] = targetUrl.host;
     outboundHeaders["referer"] = UPSTREAM + "/";
-    
-    // Scrub internal cloud provider headers
-    delete outboundHeaders["x-forwarded-for"];
-    delete outboundHeaders["x-nf-client-connection-ip"];
 
     const response = await fetch(targetUrl.href, {
       method: event.httpMethod,
@@ -91,49 +93,56 @@ exports.handler = async function (event, context) {
       redirect: "manual"
     });
 
-    // Capture standard response headers
     const responseHeaders = { ...getCorsHeaders() };
     response.headers.forEach((value, key) => {
-      responseHeaders[key] = value;
+      // Don't forward restrictive security policies that freeze iframe assets
+      if (!["content-security-policy", "x-frame-options", "content-encoding"].includes(key.toLowerCase())) {
+        responseHeaders[key] = value;
+      }
     });
 
-    // Handle Upstream location redirects
-    if (response.status >= 300 && response.status < 400 && responseHeaders["location"]) {
+    if (response.status >= 300 && response.status < 400 && response.headers.get("location")) {
       try {
-        const dest = new URL(responseHeaders["location"], targetUrl.href);
-        if (isAllowedHost(dest.hostname)) {
-          responseHeaders["location"] = `/proxy/${encodeURIComponent(dest.href)}`;
-        }
-      } catch (e) {
-        // Fallback safely if URL mapping fails
-      }
+        const dest = new URL(response.headers.get("location"), targetUrl.href);
+        responseHeaders["location"] = `/proxy/${encodeURIComponent(dest.href)}`;
+        return { statusCode: response.status, headers: responseHeaders, body: "" };
+      } catch (e) {}
     }
 
-    // Read payload asset data
     const contentType = response.headers.get("content-type") || "";
-    let bodyData;
-    let isBase64Encoded = false;
-
-    if (contentType.includes("text") || contentType.includes("json") || contentType.includes("javascript")) {
-      bodyData = await response.text();
-    } else {
-      const buffer = await response.arrayBuffer();
-      bodyData = Buffer.from(buffer).toString("base64");
-      isBase64Encoded = true;
+    
+    // Core HTML / JS Modification Layer to stop the blank page loop
+    if (contentType.includes("text/html") || contentType.includes("application/javascript") || contentType.includes("text/javascript")) {
+      let text = await response.text();
+      
+      if (contentType.includes("text/html")) {
+        // Force relative elements, assets, and source sets to pass through your Netlify mirror gateway
+        text = text.replace(/(src|href|action)="\/(?!\/)/g, `$1="${hostUrl}/`);
+        text = text.replace(/(src|href|action)='\/(?!\/)/g, `$1='${hostUrl}/`);
+      }
+      
+      return {
+        statusCode: response.status,
+        headers: { ...responseHeaders, "content-type": contentType },
+        body: text,
+        isBase64Encoded: false
+      };
     }
 
+    // Binary Assets (WASM, Images, Audio streams)
+    const buffer = await response.arrayBuffer();
     return {
       statusCode: response.status,
       headers: responseHeaders,
-      body: bodyData,
-      isBase64Encoded
+      body: Buffer.from(buffer).toString("base64"),
+      isBase64Encoded: true
     };
 
   } catch (err) {
     return {
       statusCode: 502,
       headers,
-      body: `Proxy failure processing request: ${err.message}`
+      body: `Proxy asset streaming exception: ${err.message}`
     };
   }
 };
